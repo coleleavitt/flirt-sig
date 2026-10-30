@@ -1,50 +1,124 @@
-//! `flirt-sig <file.sig> [--dump N|all]`: prints the header, the module count and the
-//! first N modules (default 5).
+//! `flirt-sig dump <file.sig> [N|all]` prints the header, the module count and the first
+//! N modules (default 5).
+//!
+//! `flirt-sig scan <file.sig> <binary> [--sweep]` matches the signature against the
+//! executable sections of an ELF, PE or Mach-O file and prints `address name` for each
+//! public of each matching module. By default it tries the function starts it can find
+//! (symbols, `.eh_frame`, `.pdata`); `--sweep` tries every byte offset instead.
 
+mod starts;
+
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use flirt_sig::{Extra40, Header, InsnBits, Module, Signature, Site};
+use flirt_sig::{Endian, Extra40, Header, Hit, InsnBits, Matcher, Module, Signature, Site};
+use object::{Object, ObjectSection, SectionKind};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (path, dump) = match args.as_slice() {
-        [path] => (path, Some(5)),
-        [path, flag, n] if flag == "--dump" => match n.as_str() {
-            "all" => (path, None),
+    let result = match args.as_slice() {
+        [cmd, sig] if cmd == "dump" => dump(sig, Some(5)),
+        [cmd, sig, n] if cmd == "dump" => match n.as_str() {
+            "all" => dump(sig, None),
             n => match n.parse() {
-                Ok(n) => (path, Some(n)),
+                Ok(n) => dump(sig, Some(n)),
                 Err(_) => return usage(),
             },
         },
+        [cmd, sig, binary] if cmd == "scan" => scan(sig, binary, false),
+        [cmd, sig, binary, flag] if cmd == "scan" && flag == "--sweep" => scan(sig, binary, true),
         _ => return usage(),
     };
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{path}: {e}");
-            return ExitCode::FAILURE;
+            eprintln!("{e}");
+            ExitCode::FAILURE
         }
-    };
-    let sig = match Signature::parse(&data) {
-        Ok(sig) => sig,
-        Err(e) => {
-            eprintln!("{path}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    print_header(&sig.header);
-    println!("modules={}", sig.modules.len());
-    let count = dump.unwrap_or(sig.modules.len());
-    for module in sig.modules.iter().take(count) {
-        println!("{}", format_module(module));
     }
-    ExitCode::SUCCESS
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: flirt-sig <file.sig> [--dump N|all]");
+    eprintln!("usage: flirt-sig dump <file.sig> [N|all]");
+    eprintln!("       flirt-sig scan <file.sig> <binary> [--sweep]");
     ExitCode::FAILURE
+}
+
+fn read(path: &str) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+}
+
+fn load(path: &str) -> Result<Signature, String> {
+    Signature::parse(&read(path)?).map_err(|e| format!("{path}: {e}"))
+}
+
+fn dump(path: &str, count: Option<usize>) -> Result<(), String> {
+    let sig = load(path)?;
+    print_header(&sig.header);
+    println!("modules={}", sig.modules.len());
+    let count = count.unwrap_or(sig.modules.len());
+    for module in sig.modules.iter().take(count) {
+        println!("{}", format_module(module));
+    }
+    Ok(())
+}
+
+fn scan(sig_path: &str, binary_path: &str, sweep: bool) -> Result<(), String> {
+    let sig = load(sig_path)?;
+    let data = read(binary_path)?;
+    let file = object::File::parse(&*data).map_err(|e| format!("{binary_path}: {e}"))?;
+    let endian = if file.is_little_endian() {
+        Endian::Little
+    } else {
+        Endian::Big
+    };
+    let matcher = Matcher::new(&sig, endian);
+    let starts = if sweep {
+        BTreeSet::new()
+    } else {
+        starts::function_starts(&file)
+    };
+    if !sweep && starts.is_empty() {
+        return Err(format!(
+            "{binary_path}: no function starts found; try --sweep"
+        ));
+    }
+    for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
+        let code = section.data().map_err(|e| format!("{binary_path}: {e}"))?;
+        let base = section.address();
+        let hits = if sweep {
+            matcher.scan(code)
+        } else {
+            starts
+                .range(base..base + code.len() as u64)
+                .filter_map(|&address| {
+                    let offset = (address - base) as usize;
+                    let modules = matcher.match_at(&code[offset..]);
+                    (!modules.is_empty()).then_some(Hit { offset, modules })
+                })
+                .collect()
+        };
+        for hit in hits {
+            let start = base + hit.offset as u64;
+            let ambiguous = hit.modules.len() > 1;
+            for module in &hit.modules {
+                for public in &module.publics {
+                    let address = start.wrapping_add_signed(public.offset);
+                    let mut line =
+                        format!("{address:#x} {}", String::from_utf8_lossy(&public.name));
+                    if public.offset != 0 {
+                        write!(line, " [in module at {start:#x}]").unwrap();
+                    }
+                    if ambiguous {
+                        line.push_str(" (ambiguous)");
+                    }
+                    println!("{line}");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn print_header(h: &Header) {

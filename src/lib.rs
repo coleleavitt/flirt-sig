@@ -8,11 +8,16 @@
 //! one or more [`Module`]s: the full pattern, a CRC-16 over the bytes after the pattern, the
 //! public names the module defines, and optional tail bytes, a referenced name and
 //! (version 11) relocation sites.
+//!
+//! [`Matcher`] checks modules against code: pattern, CRC-16, tail bytes and expected
+//! instruction bits. Checking referenced names is left to the caller.
 
+mod matcher;
 mod reader;
 
 use std::io::{self, Read};
 
+pub use matcher::{Endian, Hit, Matcher};
 use reader::Reader;
 
 /// Errors from [`Signature::parse`].
