@@ -1,0 +1,9 @@
+[package]
+name = "flirt-sig"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flate2 = "1.1.10"
+ruzstd = "0.9.1"
+thiserror = "2.0.21"
