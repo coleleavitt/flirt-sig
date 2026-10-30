@@ -6,13 +6,14 @@
 //! public of each matching module. By default it tries the function starts it can find
 //! (symbols, `.eh_frame`, `.pdata`); `--sweep` tries every byte offset instead.
 
+mod code_info;
 mod starts;
 
-use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::process::ExitCode;
 
-use flirt_sig::{Endian, Extra40, Header, Hit, InsnBits, Matcher, Module, Signature, Site};
+use code_info::ObjectInfo;
+use flirt_sig::{Endian, Extra40, Header, InsnBits, Matcher, Module, Resolution, Signature, Site};
 use object::{Object, ObjectSection, SectionKind};
 
 fn main() -> ExitCode {
@@ -74,11 +75,8 @@ fn scan(sig_path: &str, binary_path: &str, sweep: bool) -> Result<(), String> {
         Endian::Big
     };
     let matcher = Matcher::new(&sig, endian);
-    let starts = if sweep {
-        BTreeSet::new()
-    } else {
-        starts::function_starts(&file)
-    };
+    let info = ObjectInfo::new(&file);
+    let starts = starts::function_starts(&file);
     if !sweep && starts.is_empty() {
         return Err(format!(
             "{binary_path}: no function starts found; try --sweep"
@@ -87,38 +85,49 @@ fn scan(sig_path: &str, binary_path: &str, sweep: bool) -> Result<(), String> {
     for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
         let code = section.data().map_err(|e| format!("{binary_path}: {e}"))?;
         let base = section.address();
-        let hits = if sweep {
-            matcher.scan(code)
+        let offsets: Box<dyn Iterator<Item = usize>> = if sweep {
+            Box::new(0..code.len())
         } else {
-            starts
-                .range(base..base + code.len() as u64)
-                .filter_map(|&address| {
-                    let offset = (address - base) as usize;
-                    let modules = matcher.match_at(&code[offset..]);
-                    (!modules.is_empty()).then_some(Hit { offset, modules })
-                })
-                .collect()
+            Box::new(
+                starts
+                    .range(base..base + code.len() as u64)
+                    .map(|&address| (address - base) as usize),
+            )
         };
-        for hit in hits {
-            let start = base + hit.offset as u64;
-            let ambiguous = hit.modules.len() > 1;
-            for module in &hit.modules {
-                for public in &module.publics {
-                    let address = start.wrapping_add_signed(public.offset);
-                    let mut line =
-                        format!("{address:#x} {}", String::from_utf8_lossy(&public.name));
-                    if public.offset != 0 {
-                        write!(line, " [in module at {start:#x}]").unwrap();
-                    }
-                    if ambiguous {
-                        line.push_str(" (ambiguous)");
-                    }
-                    println!("{line}");
-                }
+        // After a match, skip the bytes the module covers.
+        let mut covered_until = 0;
+        for offset in offsets {
+            if offset < covered_until {
+                continue;
+            }
+            let start = base + offset as u64;
+            let (modules, ambiguous) = match matcher.resolve(&code[offset..], start, &info) {
+                Resolution::Match(module) => (vec![module], false),
+                Resolution::Ambiguous(modules) => (modules, true),
+                Resolution::NoMatch | Resolution::Delayed => continue,
+            };
+            let longest = modules.iter().map(|m| m.length as usize).max().unwrap_or(1);
+            covered_until = offset + longest.max(1);
+            for module in modules {
+                print_publics(module, start, ambiguous);
             }
         }
     }
     Ok(())
+}
+
+fn print_publics(module: &Module, start: u64, ambiguous: bool) {
+    for public in &module.publics {
+        let address = start.wrapping_add_signed(public.offset);
+        let mut line = format!("{address:#x} {}", String::from_utf8_lossy(&public.name));
+        if public.offset != 0 {
+            write!(line, " [in module at {start:#x}]").unwrap();
+        }
+        if ambiguous {
+            line.push_str(" (ambiguous)");
+        }
+        println!("{line}");
+    }
 }
 
 fn print_header(h: &Header) {

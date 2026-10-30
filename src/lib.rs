@@ -10,15 +10,19 @@
 //! (version 11) relocation sites.
 //!
 //! [`Matcher`] checks modules against code: pattern, CRC-16, tail bytes and expected
-//! instruction bits. Checking referenced names is left to the caller.
+//! instruction bits. [`Matcher::resolve`] adds the name checks and the arbitration
+//! between candidates, using names and references the caller supplies through
+//! [`CodeInfo`].
 
 mod matcher;
 mod reader;
+mod resolve;
 
 use std::io::{self, Read};
 
-pub use matcher::{Endian, Hit, Matcher};
+pub use matcher::{Endian, Matcher};
 use reader::Reader;
+pub use resolve::{CodeInfo, Resolution};
 
 /// Errors from [`Signature::parse`].
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +39,8 @@ pub enum Error {
     Decompress(#[source] io::Error),
 }
 
+/// Header flag: a startup signature, matched at the program entry point.
+pub const FLAG_STARTUP: u16 = 0x01;
 /// Header flag: the pattern tree is deflate-compressed (raw deflate before version 7,
 /// a zlib stream from version 7).
 pub const FLAG_ZLIB: u16 = 0x10;

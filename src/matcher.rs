@@ -11,12 +11,12 @@ pub enum Endian {
 
 /// Matches the modules of one [`Signature`] against code bytes.
 ///
-/// A module matches at an address when its pattern, its CRC-16, its tail bytes and the
-/// expected instruction bits of its publics and sites all agree with the code there.
-/// References and site names are not checked: that needs the names of the code the
-/// match calls, which the caller has to supply. Linker relaxation is not modelled.
+/// [`Matcher::match_at`] checks what the bytes alone decide: the pattern, the CRC-16,
+/// the tail bytes and the expected instruction bits of publics and sites.
+/// [`Matcher::resolve`] adds the checks that need names of the surrounding code, which
+/// the caller supplies through [`crate::CodeInfo`]. Linker relaxation is not modelled.
 pub struct Matcher<'a> {
-    sig: &'a Signature,
+    pub(crate) sig: &'a Signature,
     endian: Endian,
     nodes: Vec<Node>,
 }
@@ -29,13 +29,6 @@ struct Node {
     wildcard: Option<usize>,
     /// Indices of the modules whose pattern ends here.
     modules: Vec<usize>,
-}
-
-/// Modules that match at one offset of a scan.
-#[derive(Debug)]
-pub struct Hit<'a> {
-    pub offset: usize,
-    pub modules: Vec<&'a Module>,
 }
 
 impl<'a> Matcher<'a> {
@@ -57,23 +50,6 @@ impl<'a> Matcher<'a> {
         self.walk(0, code, 0, &mut found);
         found.retain(|m| self.leaf_matches(m, code));
         found
-    }
-
-    /// Tries every offset of `code`. After a hit, the scan continues after the longest
-    /// matching module.
-    pub fn scan(&self, code: &[u8]) -> Vec<Hit<'a>> {
-        let mut hits = Vec::new();
-        let mut offset = 0;
-        while offset < code.len() {
-            let modules = self.match_at(&code[offset..]);
-            let Some(len) = modules.iter().map(|m| m.length as usize).max() else {
-                offset += 1;
-                continue;
-            };
-            hits.push(Hit { offset, modules });
-            offset += len.max(1);
-        }
-        hits
     }
 
     fn walk(&self, node: usize, code: &[u8], depth: usize, found: &mut Vec<&'a Module>) {
@@ -251,17 +227,5 @@ mod tests {
         };
         assert_eq!(Matcher::new(&sig, Endian::Little).match_at(&code).len(), 1);
         assert!(Matcher::new(&sig, Endian::Big).match_at(&code).is_empty());
-    }
-
-    #[test]
-    fn scan_skips_matched_modules() {
-        let code = [0xc3, 0x55, 0x55, 0xc3, 0x55];
-        let sig = Signature {
-            header: header(2),
-            modules: vec![module(&[Some(0x55), Some(0x55)], "pair", 0, 0, 2)],
-        };
-        let hits = Matcher::new(&sig, Endian::Little).scan(&code);
-        let offsets: Vec<_> = hits.iter().map(|h| h.offset).collect();
-        assert_eq!(offsets, [1]);
     }
 }
