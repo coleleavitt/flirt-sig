@@ -21,27 +21,29 @@ pub struct Matcher<'a> {
     nodes: Vec<Node>,
 }
 
-/// A byte-level trie over the module patterns. Node 0 is the root.
+/// A path-compressed trie over the module patterns. Node 0 is the root and has an empty
+/// label; every other node is reached over its `label` (`None` matches any byte).
 #[derive(Default)]
 struct Node {
-    /// Children for a concrete byte, sorted by byte.
-    exact: Vec<(u8, usize)>,
-    wildcard: Option<usize>,
+    label: Box<[Option<u8>]>,
+    /// Children keyed by the first element of their label, sorted (a wildcard first).
+    children: Vec<(Option<u8>, u32)>,
     /// Indices of the modules whose pattern ends here.
-    modules: Vec<usize>,
+    modules: Vec<u32>,
 }
 
 impl<'a> Matcher<'a> {
     pub fn new(sig: &'a Signature, endian: Endian) -> Self {
         let mut nodes = vec![Node::default()];
         for (index, module) in sig.modules.iter().enumerate() {
-            let mut at = 0;
-            for &byte in &module.pattern {
-                at = child(&mut nodes, at, byte);
-            }
-            nodes[at].modules.push(index);
+            insert(&mut nodes, &module.pattern, index as u32);
         }
         Self { sig, endian, nodes }
+    }
+
+    /// The signature this matcher was built from.
+    pub fn signature(&self) -> &'a Signature {
+        self.sig
     }
 
     /// The modules that match `code`, which starts at the candidate address.
@@ -54,15 +56,29 @@ impl<'a> Matcher<'a> {
 
     fn walk(&self, node: usize, code: &[u8], depth: usize, found: &mut Vec<&'a Module>) {
         let node = &self.nodes[node];
-        found.extend(node.modules.iter().map(|&i| &self.sig.modules[i]));
+        found.extend(node.modules.iter().map(|&i| &self.sig.modules[i as usize]));
         let Some(&byte) = code.get(depth) else {
             return;
         };
-        if let Ok(i) = node.exact.binary_search_by_key(&byte, |&(b, _)| b) {
-            self.walk(node.exact[i].1, code, depth + 1, found);
-        }
-        if let Some(next) = node.wildcard {
-            self.walk(next, code, depth + 1, found);
+        let wildcard = node.children.first().filter(|(k, _)| k.is_none());
+        let exact = node
+            .children
+            .binary_search_by_key(&Some(byte), |&(k, _)| k)
+            .ok()
+            .map(|i| &node.children[i]);
+        for &(_, child) in wildcard.into_iter().chain(exact) {
+            let label = &self.nodes[child as usize].label;
+            let end = depth + label.len();
+            let Some(bytes) = code.get(depth..end) else {
+                continue;
+            };
+            if label
+                .iter()
+                .zip(bytes)
+                .all(|(p, b)| p.is_none_or(|p| p == *b))
+            {
+                self.walk(child as usize, code, end, found);
+            }
         }
     }
 
@@ -108,20 +124,48 @@ impl<'a> Matcher<'a> {
     }
 }
 
-fn child(nodes: &mut Vec<Node>, at: usize, byte: Option<u8>) -> usize {
-    let next = nodes.len();
-    match byte {
-        None => match nodes[at].wildcard {
-            Some(existing) => return existing,
-            None => nodes[at].wildcard = Some(next),
-        },
-        Some(byte) => match nodes[at].exact.binary_search_by_key(&byte, |&(b, _)| b) {
-            Ok(i) => return nodes[at].exact[i].1,
-            Err(i) => nodes[at].exact.insert(i, (byte, next)),
-        },
+fn insert(nodes: &mut Vec<Node>, pattern: &[Option<u8>], module: u32) {
+    let mut at = 0;
+    let mut rest = pattern;
+    loop {
+        let Some(&first) = rest.first() else {
+            nodes[at].modules.push(module);
+            return;
+        };
+        let new = nodes.len() as u32;
+        match nodes[at].children.binary_search_by_key(&first, |&(k, _)| k) {
+            Err(i) => {
+                nodes[at].children.insert(i, (first, new));
+                nodes.push(Node {
+                    label: rest.into(),
+                    children: Vec::new(),
+                    modules: vec![module],
+                });
+                return;
+            }
+            Ok(i) => {
+                let child = nodes[at].children[i].1 as usize;
+                let label = &nodes[child].label;
+                let common = label.iter().zip(rest).take_while(|(a, b)| a == b).count();
+                if common < label.len() {
+                    let tail: Box<[Option<u8>]> = label[common..].into();
+                    let head: Box<[Option<u8>]> = label[..common].into();
+                    nodes[child].label = tail;
+                    let key = nodes[child].label[0];
+                    nodes.push(Node {
+                        label: head,
+                        children: vec![(key, child as u32)],
+                        modules: Vec::new(),
+                    });
+                    nodes[at].children[i].1 = new;
+                    at = new as usize;
+                } else {
+                    at = child;
+                }
+                rest = &rest[common..];
+            }
+        }
     }
-    nodes.push(Node::default());
-    next
 }
 
 #[cfg(test)]

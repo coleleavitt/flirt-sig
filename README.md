@@ -3,6 +3,16 @@
 Reader and matcher for IDA FLIRT `.sig` signature files, format versions 5 to 11.
 
 ```
+cargo install flirt-sig
+```
+
+As a library, without the command-line tool's dependencies:
+
+```toml
+flirt-sig = { version = "0.1", default-features = false }
+```
+
+```
 flirt-sig dump <file.sig> [N|all]
 flirt-sig scan <file.sig> <binary> [--sweep]
 ```
@@ -49,3 +59,13 @@ absolute operands, and AArch64 `b`/`bl`.
 
   The others are aliases of the same code (for example `free_mem` for
   `__intl_freemem`).
+
+## Used by
+
+- [kuna](https://github.com/Noelo-Lab/kuna), whose `flirt` analysis pass names library
+  functions in stripped binaries with this crate.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
