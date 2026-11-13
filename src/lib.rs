@@ -19,6 +19,7 @@ mod reader;
 mod resolve;
 
 use std::io::{self, Read};
+use std::sync::Arc;
 
 pub use matcher::{Endian, Matcher};
 use reader::Reader;
@@ -37,7 +38,16 @@ pub enum Error {
     TrailingData { remaining: usize },
     #[error("cannot decompress the pattern tree")]
     Decompress(#[source] io::Error),
+    #[error("the parsed signature would take more than {MAX_EXPANSION} bytes per byte of the file")]
+    TooLarge,
+    #[error("pattern tree node at offset {offset:#x} runs past the header's pattern length")]
+    PatternTooLong { offset: usize },
 }
+
+/// [`Signature::parse`] fails with [`Error::TooLarge`] when the decompressed pattern tree
+/// and the parsed modules would take more than this many bytes per byte of the file.
+/// The signature files shipped with IDA 9.5 take at most 81 (`arc/millicode.sig`).
+pub const MAX_EXPANSION: usize = 256;
 
 /// Header flag: a startup signature, matched at the program entry point.
 pub const FLAG_STARTUP: u16 = 0x01;
@@ -84,8 +94,9 @@ pub struct Signature {
 /// One library module: a leaf of the pattern tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Module {
-    /// The leading bytes of the module; `None` is a wildcard byte.
-    pub pattern: Vec<Option<u8>>,
+    /// The leading bytes of the module; `None` is a wildcard byte. The modules of one
+    /// leaf of the pattern tree share it.
+    pub pattern: Arc<[Option<u8>]>,
     /// Number of bytes after the pattern covered by [`Module::crc`].
     pub crc_len: u8,
     /// See [`crc16`].
@@ -153,12 +164,14 @@ impl Signature {
     pub fn parse(data: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(data);
         let header = Header::read(&mut r)?;
+        let mut budget = Budget(data.len().saturating_mul(MAX_EXPANSION));
         let body = r.take(r.remaining())?;
-        let body = decompress(body, &header)?;
+        let body = decompress(body, &header, budget.0)?;
+        budget.charge(body.len())?;
 
         let mut r = Reader::new(&body);
         let mut modules = Vec::new();
-        read_tree(&mut r, header.version, &mut Vec::new(), &mut modules)?;
+        read_tree(&mut r, &header, &mut budget, &mut modules)?;
         if r.remaining() != 0 {
             return Err(Error::TrailingData {
                 remaining: r.remaining(),
@@ -221,53 +234,92 @@ impl Header {
     }
 }
 
-fn decompress(body: &[u8], header: &Header) -> Result<Vec<u8>, Error> {
+/// Bytes the parsed signature may still take; see [`MAX_EXPANSION`].
+struct Budget(usize);
+
+impl Budget {
+    fn charge(&mut self, bytes: usize) -> Result<(), Error> {
+        self.0 = self.0.checked_sub(bytes).ok_or(Error::TooLarge)?;
+        Ok(())
+    }
+}
+
+/// Decompresses the pattern tree, failing with [`Error::TooLarge`] past `limit` bytes.
+fn decompress(body: &[u8], header: &Header, limit: usize) -> Result<Vec<u8>, Error> {
+    let compressed = header.flags & (FLAG_ZSTD | FLAG_ZLIB) != 0;
+    if !compressed {
+        return Ok(body.to_vec());
+    }
     let mut out = Vec::new();
-    if header.flags & FLAG_ZSTD != 0 {
+    let read = if header.flags & FLAG_ZSTD != 0 {
         let mut input = body;
         ruzstd::decoding::StreamingDecoder::new(&mut input)
             .map_err(io::Error::other)
-            .and_then(|mut d| d.read_to_end(&mut out))
-            .map_err(Error::Decompress)?;
-    } else if header.flags & FLAG_ZLIB != 0 {
+            .and_then(|d| read_capped(d, limit, &mut out))
+    } else if header.version < 7 {
         // Versions 5 and 6 store raw deflate data; later versions add the zlib wrapper.
-        let read = if header.version < 7 {
-            flate2::read::DeflateDecoder::new(body).read_to_end(&mut out)
-        } else {
-            flate2::read::ZlibDecoder::new(body).read_to_end(&mut out)
-        };
-        read.map_err(Error::Decompress)?;
+        read_capped(flate2::read::DeflateDecoder::new(body), limit, &mut out)
     } else {
-        out.extend_from_slice(body);
+        read_capped(flate2::read::ZlibDecoder::new(body), limit, &mut out)
+    };
+    read.map_err(Error::Decompress)?;
+    if out.len() > limit {
+        return Err(Error::TooLarge);
     }
     Ok(out)
 }
 
+/// Reads at most one byte more than `limit`, so the caller can tell that the limit was
+/// passed.
+fn read_capped(reader: impl Read, limit: usize, out: &mut Vec<u8>) -> io::Result<usize> {
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    reader.take(limit).read_to_end(out)
+}
+
+/// Reads the pattern tree depth-first. A node holds a run of pattern bytes and either
+/// child nodes or, with no children, a leaf of modules.
 fn read_tree(
     r: &mut Reader<'_>,
-    version: u8,
-    pattern: &mut Vec<Option<u8>>,
+    header: &Header,
+    budget: &mut Budget,
     out: &mut Vec<Module>,
 ) -> Result<(), Error> {
-    let children = r.var15()?;
-    if children == 0 {
-        return read_leaf(r, version, pattern, out);
-    }
-    for _ in 0..children {
-        let len = if version >= 10 {
+    let max_len = usize::from(header.pattern_len);
+    let mut pattern = Vec::new();
+    // Per open node: the children still to read and the pattern length before them.
+    let mut open: Vec<(u16, usize)> = Vec::new();
+    loop {
+        let children = r.var15()?;
+        if children == 0 {
+            budget.charge(size_of_val(pattern.as_slice()))?;
+            read_leaf(r, header.version, pattern.as_slice().into(), budget, out)?;
+        } else {
+            open.push((children, pattern.len()));
+        }
+        loop {
+            let Some((left, prefix_len)) = open.last_mut() else {
+                return Ok(());
+            };
+            pattern.truncate(*prefix_len);
+            if *left > 0 {
+                *left -= 1;
+                break;
+            }
+            open.pop();
+        }
+        let offset = r.offset();
+        let len = if header.version >= 10 {
             usize::from(r.var15()?)
         } else {
             usize::from(r.u8()?)
         };
-        let wildcards = read_wildcards(r, len)?;
-        let prefix_len = pattern.len();
-        for wild in wildcards {
+        if pattern.len() + len > max_len {
+            return Err(Error::PatternTooLong { offset });
+        }
+        for wild in read_wildcards(r, len)? {
             pattern.push(if wild { None } else { Some(r.u8()?) });
         }
-        read_tree(r, version, pattern, out)?;
-        pattern.truncate(prefix_len);
     }
-    Ok(())
 }
 
 /// Reads the wildcard mask of a tree node with `len` pattern bytes. The most significant
@@ -294,7 +346,8 @@ fn read_wildcards(r: &mut Reader<'_>, len: usize) -> Result<Vec<bool>, Error> {
 fn read_leaf(
     r: &mut Reader<'_>,
     version: u8,
-    pattern: &[Option<u8>],
+    pattern: Arc<[Option<u8>]>,
+    budget: &mut Budget,
     out: &mut Vec<Module>,
 ) -> Result<(), Error> {
     let read_offset = |r: &mut Reader<'_>| {
@@ -316,6 +369,7 @@ fn read_leaf(
             loop {
                 let delta = read_offset(r)?;
                 let (public, next) = read_public(r, version)?;
+                budget.charge(size_of::<Public>() + public.name.len())?;
                 let negative = version >= 11 && public.flags & 0x10 != 0;
                 offset += if negative {
                     -i64::from(delta)
@@ -334,6 +388,7 @@ fn read_leaf(
                 let count = if version >= 8 { r.u8()? } else { 1 };
                 for _ in 0..count {
                     let offset = read_offset(r)?;
+                    budget.charge(size_of::<TailByte>())?;
                     tail_bytes.push(TailByte {
                         offset,
                         value: r.u8()?,
@@ -342,25 +397,29 @@ fn read_leaf(
             }
 
             let reference = if more & 4 != 0 {
-                Some(read_reference(r, version)?)
+                let reference = read_reference(r, version)?;
+                budget.charge(reference.name.len())?;
+                Some(reference)
             } else {
                 None
             };
 
             let sites = if version >= 11 && more & 0x20 != 0 {
-                read_sites(r)?
+                read_sites(r, budget)?
             } else {
                 Vec::new()
             };
             let mut alt_sites = Vec::new();
             if version >= 11 && more & 0x40 != 0 {
                 for _ in 0..r.var32()? {
-                    alt_sites.push(read_sites(r)?);
+                    budget.charge(size_of::<Vec<Site>>())?;
+                    alt_sites.push(read_sites(r, budget)?);
                 }
             }
 
+            budget.charge(size_of::<Module>())?;
             out.push(Module {
-                pattern: pattern.to_vec(),
+                pattern: Arc::clone(&pattern),
                 crc_len,
                 crc,
                 length,
@@ -443,8 +502,14 @@ fn read_reference(r: &mut Reader<'_>, version: u8) -> Result<Reference, Error> {
     })
 }
 
-fn read_sites(r: &mut Reader<'_>) -> Result<Vec<Site>, Error> {
-    (0..r.var32()?).map(|_| read_site(r)).collect()
+fn read_sites(r: &mut Reader<'_>, budget: &mut Budget) -> Result<Vec<Site>, Error> {
+    (0..r.var32()?)
+        .map(|_| {
+            let site = read_site(r)?;
+            budget.charge(size_of::<Site>() + site.name.len())?;
+            Ok(site)
+        })
+        .collect()
 }
 
 fn read_site(r: &mut Reader<'_>) -> Result<Site, Error> {
@@ -508,6 +573,80 @@ mod tests {
     fn crc16_is_swapped_x25() {
         // CRC-16/X.25 check value for "123456789" is 0x906e.
         assert_eq!(crc16(b"123456789"), 0x6e90);
+    }
+
+    /// A version 10 header with pattern length `pattern_len` and flags `flags`.
+    fn v10_header(pattern_len: u16, flags: u16) -> Vec<u8> {
+        let mut h = b"IDASGN\x0a\x00".to_vec();
+        h.extend_from_slice(&[0; 6]); // file_formats, os_types
+        h.extend_from_slice(&[0; 2]); // app_types
+        h.extend_from_slice(&flags.to_le_bytes());
+        h.extend_from_slice(&[0; 4 + 12]); // module_count_v5, ctype_crc, ctype_name
+        h.push(0); // name length
+        h.extend_from_slice(&[0; 2 + 4]); // ctype_crc_alt, module_count
+        h.extend_from_slice(&pattern_len.to_le_bytes());
+        h.extend_from_slice(&[0; 2]); // ctype_crc_3v
+        h
+    }
+
+    /// A leaf with `count` modules of one unnamed public each.
+    fn leaf(count: usize) -> Vec<u8> {
+        let mut leaf = vec![0, 0, 0]; // crc_len, crc
+        for i in 0..count {
+            let more = if i + 1 < count { 8 } else { 0 };
+            // length, delta, public flags, then no name bytes before the terminator
+            leaf.extend_from_slice(&[1, 0, 0, more]);
+        }
+        leaf
+    }
+
+    #[test]
+    fn deep_tree_does_not_recurse() {
+        // 100,000 nested nodes with no pattern bytes: one child, length 0, empty mask.
+        let mut sig = v10_header(32, 0);
+        sig.extend(std::iter::repeat_n([1, 0, 0], 100_000).flatten());
+        sig.push(0);
+        sig.extend(leaf(1));
+        assert_eq!(Signature::parse(&sig).unwrap().modules.len(), 1);
+    }
+
+    #[test]
+    fn modules_of_a_leaf_share_the_pattern() {
+        let mut sig = v10_header(32, 0);
+        sig.extend_from_slice(&[1, 2, 0b00, 0x55, 0xaa, 0]); // one node: 55 aa
+        sig.extend(leaf(3));
+        let modules = Signature::parse(&sig).unwrap().modules;
+        assert_eq!(*modules[0].pattern, [Some(0x55), Some(0xaa)]);
+        assert!(
+            modules
+                .iter()
+                .all(|m| Arc::ptr_eq(&m.pattern, &modules[0].pattern))
+        );
+    }
+
+    #[test]
+    fn rejects_patterns_longer_than_the_header_says() {
+        let mut sig = v10_header(2, 0);
+        sig.extend_from_slice(&[1, 2, 0b11, 1, 1, 0b1, 0]); // 2 wildcards, then 1 more
+        sig.extend(leaf(1));
+        assert!(matches!(
+            Signature::parse(&sig),
+            Err(Error::PatternTooLong { offset: 4 })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_decompression_bomb() {
+        use std::io::Write;
+
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+
+        let mut body = ZlibEncoder::new(Vec::new(), Compression::best());
+        body.write_all(&[0; 1 << 20]).unwrap();
+        let mut sig = v10_header(32, FLAG_ZLIB);
+        sig.extend(body.finish().unwrap());
+        assert!(matches!(Signature::parse(&sig), Err(Error::TooLarge)));
     }
 
     #[test]

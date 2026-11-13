@@ -160,7 +160,7 @@ fn print_header(h: &Header) {
 
 fn format_module(m: &Module) -> String {
     let mut s = String::new();
-    for byte in &m.pattern {
+    for byte in m.pattern.iter() {
         match byte {
             Some(b) => write!(s, "{b:02X}").unwrap(),
             None => s.push_str(".."),

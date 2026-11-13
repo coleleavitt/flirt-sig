@@ -9,7 +9,7 @@ cargo install flirt-sig
 As a library, without the command-line tool's dependencies:
 
 ```toml
-flirt-sig = { version = "0.1", default-features = false }
+flirt-sig = { version = "0.2", default-features = false }
 ```
 
 ```
@@ -27,7 +27,10 @@ which also matches inside functions and is much noisier.
 
 ## Library
 
-- `Signature::parse` reads a whole file into a header and a list of modules.
+- `Signature::parse` reads a whole file into a header and a list of modules. It fails
+  with `Error::TooLarge` when the decompressed tree and the parsed modules would take
+  more than 256 bytes per byte of the file (IDA's files take at most 81), so a crafted
+  file cannot exhaust memory.
 - `Matcher::match_at` returns the modules whose pattern, CRC-16, tail bytes and
   expected instruction bits match the code at an address.
 - `Matcher::resolve` adds the checks that need names. The caller implements

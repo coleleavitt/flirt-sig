@@ -11,6 +11,10 @@ impl<'a> Reader<'a> {
         Self { data, pos: 0 }
     }
 
+    pub(crate) fn offset(&self) -> usize {
+        self.pos
+    }
+
     pub(crate) fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }

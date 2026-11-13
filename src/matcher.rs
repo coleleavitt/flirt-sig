@@ -195,7 +195,7 @@ mod tests {
 
     fn module(pattern: &[Option<u8>], name: &str, crc_len: u8, crc: u16, length: u32) -> Module {
         Module {
-            pattern: pattern.to_vec(),
+            pattern: pattern.into(),
             crc_len,
             crc,
             length,
