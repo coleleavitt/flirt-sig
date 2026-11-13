@@ -49,37 +49,38 @@ impl<'a> Matcher<'a> {
     /// The modules that match `code`, which starts at the candidate address.
     pub fn match_at(&self, code: &[u8]) -> Vec<&'a Module> {
         let mut found = Vec::new();
-        self.walk(0, code, 0, &mut found);
-        found.retain(|m| self.leaf_matches(m, code));
-        found
-    }
-
-    fn walk(&self, node: usize, code: &[u8], depth: usize, found: &mut Vec<&'a Module>) {
-        let node = &self.nodes[node];
-        found.extend(node.modules.iter().map(|&i| &self.sig.modules[i as usize]));
-        let Some(&byte) = code.get(depth) else {
-            return;
-        };
-        let wildcard = node.children.first().filter(|(k, _)| k.is_none());
-        let exact = node
-            .children
-            .binary_search_by_key(&Some(byte), |&(k, _)| k)
-            .ok()
-            .map(|i| &node.children[i]);
-        for &(_, child) in wildcard.into_iter().chain(exact) {
-            let label = &self.nodes[child as usize].label;
-            let end = depth + label.len();
-            let Some(bytes) = code.get(depth..end) else {
+        // Depth-first over (node, bytes matched so far); the wildcard child is visited
+        // before the exact one.
+        let mut stack = vec![(0, 0)];
+        while let Some((node, depth)) = stack.pop() {
+            let node = &self.nodes[node];
+            found.extend(node.modules.iter().map(|&i| &self.sig.modules[i as usize]));
+            let Some(&byte) = code.get(depth) else {
                 continue;
             };
-            if label
-                .iter()
-                .zip(bytes)
-                .all(|(p, b)| p.is_none_or(|p| p == *b))
-            {
-                self.walk(child as usize, code, end, found);
+            let wildcard = node.children.first().filter(|(k, _)| k.is_none());
+            let exact = node
+                .children
+                .binary_search_by_key(&Some(byte), |&(k, _)| k)
+                .ok()
+                .map(|i| &node.children[i]);
+            for &(_, child) in exact.into_iter().chain(wildcard) {
+                let label = &self.nodes[child as usize].label;
+                let end = depth + label.len();
+                let Some(bytes) = code.get(depth..end) else {
+                    continue;
+                };
+                if label
+                    .iter()
+                    .zip(bytes)
+                    .all(|(p, b)| p.is_none_or(|p| p == *b))
+                {
+                    stack.push((child as usize, end));
+                }
             }
         }
+        found.retain(|m| self.leaf_matches(m, code));
+        found
     }
 
     /// Checks everything after the pattern. The CRC region starts at the header's pattern
@@ -220,6 +221,29 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn deep_trie_does_not_recurse() {
+        // Wildcard patterns of every length up to 5,000 make a trie 5,000 nodes deep.
+        let depth = 5_000;
+        let modules = (1..=depth)
+            .map(|len| module(&vec![None; len], "m", 0, 0, 0))
+            .collect();
+        let sig = Signature {
+            header: header(depth as u16),
+            modules,
+        };
+        let found = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || {
+                let matcher = Matcher::new(&sig, Endian::Little);
+                matcher.match_at(&vec![0; depth]).len()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(found, depth);
     }
 
     #[test]
